@@ -14,6 +14,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.navigation.fragment.NavHostFragment;
@@ -52,7 +53,25 @@ public class FirstFragment extends Fragment {
         super.onViewCreated(view, savedInstanceState);
         binding.importButton.setOnClickListener(v ->
                 openBookLauncher.launch(new String[]{"application/epub+zip", "application/zip", "*/*"}));
+        binding.themeModeButton.setOnClickListener(v -> showThemeModeDialog());
         renderShelf();
+    }
+
+    private void showThemeModeDialog() {
+        String[] modes = {
+                getString(R.string.theme_follow_system),
+                getString(R.string.theme_light),
+                getString(R.string.theme_dark)
+        };
+        new AlertDialog.Builder(requireContext())
+                .setTitle(R.string.theme_mode)
+                .setSingleChoiceItems(modes, ThemeMode.selectedIndex(requireContext()),
+                        (dialog, which) -> {
+                            dialog.dismiss();
+                            ThemeMode.saveAndApply(requireContext(), ThemeMode.modeForIndex(which));
+                        })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
     }
 
     @Override
@@ -111,6 +130,7 @@ public class FirstFragment extends Fragment {
         card.setFocusable(true);
         card.setStrokeWidth(dp(1));
         card.setStrokeColor(ContextCompat.getColor(requireContext(), R.color.shelf_outline));
+        card.setCardBackgroundColor(ContextCompat.getColor(requireContext(), R.color.app_background));
         card.setRadius(dp(14));
 
         LinearLayout content = new LinearLayout(requireContext());

@@ -7,6 +7,10 @@
     <string name="import_success">《%1$s》导入成功</string>
     <string name="import_failed">EPUB 导入失败</string>
     <string name="my_bookshelf">我的书架</string>
+    <string name="theme_mode">显示模式</string>
+    <string name="theme_follow_system">跟随系统</string>
+    <string name="theme_light">浅色模式</string>
+    <string name="theme_dark">深色模式</string>
     <string name="empty_shelf">书架还是空的\n请点击左侧按钮导入一本 EPUB</string>
     <plurals name="book_count">
         <item quantity="other">%1$d 本书</item>

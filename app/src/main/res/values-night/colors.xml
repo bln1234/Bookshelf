@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand">#FF5E9F8C</color>
+    <color name="import_panel">#FF000000</color>
+    <color name="app_background">#FF000000</color>
+    <color name="reader_paper">#FF000000</color>
+    <color name="reader_controls">#FF000000</color>
+    <color name="reader_text">#FFFFFFFF</color>
+    <color name="reading_highlight">#FFFFB86C</color>
+    <color name="secondary_text">#FFFFFFFF</color>
+    <color name="shelf_outline">#FFFFFFFF</color>
+</resources>

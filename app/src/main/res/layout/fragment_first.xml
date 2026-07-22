@@ -80,6 +80,17 @@
                 android:textSize="24sp"
                 android:textStyle="bold" />
 
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/theme_mode_button"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="10dp"
+                android:minHeight="40dp"
+                android:text="@string/theme_mode"
+                android:textAllCaps="false"
+                app:icon="@android:drawable/ic_menu_manage" />
+
             <TextView
                 android:id="@+id/book_count"
                 android:layout_width="wrap_content"
