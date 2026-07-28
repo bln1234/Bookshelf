@@ -49,4 +49,10 @@
     <string name="matcha_ready">Matcha Baker 中文语音已就绪</string>
     <string name="matcha_init_failed">Matcha Baker 初始化失败，已切回系统语音：%1$s</string>
     <string name="matcha_speak_failed">Matcha Baker 朗读失败：%1$s</string>
+    <string name="delete_book">删除书籍</string>
+    <string name="delete_book_title">删除书籍</string>
+    <string name="delete_book_message">确定从书架中删除《%1$s》吗？</string>
+    <string name="delete">删除</string>
+    <string name="book_deleted">书籍已删除</string>
+    <string name="delete_book_failed">无法删除这本书</string>
 </resources>

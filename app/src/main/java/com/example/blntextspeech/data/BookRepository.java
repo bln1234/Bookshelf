@@ -25,6 +25,7 @@ import java.util.UUID;
 public final class BookRepository {
     private static final String PREFS = "bookshelf";
     private static final String KEY_INDEX = "book_index_v1";
+    private static final String KEY_ORDER_INITIALIZED = "book_order_initialized_v1";
     private static volatile BookRepository instance;
 
     private final Context context;
@@ -47,8 +48,15 @@ public final class BookRepository {
 
     public synchronized List<Book> getBooks() {
         List<Book> books = decode(preferences.getString(KEY_INDEX, ""));
+        int storedCount = books.size();
         books.removeIf(book -> !getBookFile(book).isFile());
-        books.sort(Comparator.comparingLong(Book::getImportedAt).reversed());
+        if (!preferences.getBoolean(KEY_ORDER_INITIALIZED, false)) {
+            books.sort(Comparator.comparingLong(Book::getImportedAt).reversed());
+            save(books);
+            preferences.edit().putBoolean(KEY_ORDER_INITIALIZED, true).apply();
+        } else if (books.size() != storedCount) {
+            save(books);
+        }
         return books;
     }
 
@@ -88,7 +96,7 @@ public final class BookRepository {
             Book book = new Book(id, title, author, destination.getName(), System.currentTimeMillis(), 0);
             synchronized (this) {
                 List<Book> books = getBooks();
-                books.add(book);
+                books.add(0, book);
                 save(books);
             }
             return book;
@@ -111,6 +119,45 @@ public final class BookRepository {
                 save(books);
                 return;
             }
+        }
+    }
+
+    public synchronized boolean deleteBook(String id) {
+        List<Book> books = getBooks();
+        for (int i = 0; i < books.size(); i++) {
+            Book book = books.get(i);
+            if (!book.getId().equals(id)) continue;
+            File file = getBookFile(book);
+            if (file.isFile() && !file.delete()) return false;
+            books.remove(i);
+            save(books);
+            return true;
+        }
+        return false;
+    }
+
+    public synchronized void moveBook(int fromPosition, int toPosition) {
+        List<Book> books = getBooks();
+        if (fromPosition < 0 || fromPosition >= books.size()
+                || toPosition < 0 || toPosition >= books.size()
+                || fromPosition == toPosition) {
+            return;
+        }
+        Book moved = books.remove(fromPosition);
+        books.add(toPosition, moved);
+        save(books);
+    }
+
+    public synchronized void moveBookToFront(String id) {
+        List<Book> books = getBooks();
+        for (int i = 0; i < books.size(); i++) {
+            if (!books.get(i).getId().equals(id)) continue;
+            if (i > 0) {
+                Book selected = books.remove(i);
+                books.add(0, selected);
+                save(books);
+            }
+            return;
         }
     }
 
