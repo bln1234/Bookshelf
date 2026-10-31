@@ -95,6 +95,7 @@ struct LibraryFullTextSearchView: View {
     @State private var isSearching = false
     @State private var searchTask: Task<Void, Never>?
     @State private var wasInterrupted = false
+    @State private var libraryChanged = false
 
     var body: some View {
         NavigationStack {
@@ -108,6 +109,10 @@ struct LibraryFullTextSearchView: View {
                 }
                 if wasInterrupted {
                     Text("搜索已暂停，重新输入关键词并搜索可继续。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                if libraryChanged {
+                    Text("书库已更新，重新搜索可获取最新结果。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(groups) { group in
@@ -152,6 +157,17 @@ struct LibraryFullTextSearchView: View {
                 wasInterrupted = true
             }
         }
+        .onChange(of: library.books.map(\.id)) { _, ids in
+            // In-flight searches hold a snapshot of the old library. Do not let
+            // their late results reintroduce deleted books into the list.
+            searchTask?.cancel()
+            isSearching = false
+            let activeIDs = Set(ids)
+            groups.removeAll { !activeIDs.contains($0.book.id) }
+            failedBooks.removeAll { !activeIDs.contains($0.id) }
+            libraryChanged = hasSearched
+            wasInterrupted = false
+        }
     }
 
     private func performSearch() {
@@ -161,6 +177,7 @@ struct LibraryFullTextSearchView: View {
         groups = []
         failedBooks = []
         wasInterrupted = false
+        libraryChanged = false
         completedCount = 0
         let books = library.books
         totalCount = books.count

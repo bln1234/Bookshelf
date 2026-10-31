@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import ImageIO
 
 extension UTType {
     static let epub = UTType(filenameExtension: "epub") ?? .data
@@ -15,21 +16,41 @@ struct ContentView: View {
     @AppStorage("library.lastOpenedBookID") private var lastOpenedBookID = ""
     @State private var searchText = ""
     @State private var pendingDeletion: Book?
+    @State private var detailsBook: Book?
+    @State private var importReport: BookImportReport?
+    @State private var selectedCollectionID: UUID?
+    @State private var membershipBook: Book?
+    @State private var showCollections = false
+    @State private var showDeleted = false
+    @State private var showAnnotationExport = false
+    @State private var filter: ShelfFilter = .all
+    @AppStorage("library.layout") private var layoutRaw = ShelfLayout.list.rawValue
+    @AppStorage("library.sort") private var sortRaw = ShelfSort.recent.rawValue
+
+    private var layout: ShelfLayout { ShelfLayout(rawValue: layoutRaw) ?? .list }
 
     private enum HomeTab: Hashable {
         case library, fullText, online
     }
 
     private var filteredBooks: [Book] {
-        guard !searchText.isEmpty else { return library.books }
-        return library.books.filter { $0.title.localizedStandardContains(searchText) || $0.author.localizedStandardContains(searchText) }
+        let books = library.books.filter { book in selectedCollectionID.map { book.collectionIDs.contains($0) } ?? true }
+        return LibraryOrganization.books(books, query: searchText, filter: filter, sort: ShelfSort(rawValue: sortRaw) ?? .recent)
+    }
+
+    private var shelfTitle: String {
+        library.collections.first(where: { $0.id == selectedCollectionID })?.name ?? "书架"
     }
 
     private var continueReadingBook: Book? {
-        if let lastOpened = library.books.first(where: { $0.id.uuidString == lastOpenedBookID }) {
+        if let recent = library.books.filter({ !$0.isFinished && $0.lastOpenedAt != nil })
+            .max(by: { ($0.lastOpenedAt ?? .distantPast) < ($1.lastOpenedAt ?? .distantPast) }) {
+            return recent
+        }
+        if let lastOpened = library.books.first(where: { $0.id.uuidString == lastOpenedBookID && !$0.isFinished }) {
             return lastOpened
         }
-        return library.books.first(where: { $0.locator.locatorJSON != nil || $0.locator.page > 0 })
+        return library.books.first(where: { $0.hasStartedReading && !$0.isFinished })
     }
 
     var body: some View {
@@ -46,21 +67,40 @@ struct ContentView: View {
                 .tabItem { Label("在线找书", systemImage: "globe") }
                 .tag(HomeTab.online)
         }
-        .fileImporter(isPresented: $isImporterPresented, allowedContentTypes: [.epub, .txt], allowsMultipleSelection: false) { result in
-            guard case .success(let urls) = result, let url = urls.first else {
+        .fileImporter(isPresented: $isImporterPresented, allowedContentTypes: [.epub, .txt], allowsMultipleSelection: true) { result in
+            guard case .success(let urls) = result, !urls.isEmpty else {
                 if case .failure(let error) = result { library.errorMessage = error.localizedDescription }
                 return
             }
-            Task { _ = await library.importBook(from: url) }
+            Task {
+                let report = await library.importBooks(from: urls)
+                if urls.count > 1 || !report.failures.isEmpty { importReport = report }
+            }
         }
         .sheet(isPresented: $isSettingsPresented) { AppSettingsView() }
+        .sheet(item: $detailsBook) { book in
+            BookDetailView(book: book, library: library) { book in
+                detailsBook = nil
+                open(book)
+            }
+        }
+        .sheet(item: $importReport) { report in BookImportReportView(report: report) }
+        .sheet(isPresented: $showCollections) {
+            CollectionsView(library: library) { id in selectedCollectionID = id }
+        }
+        .sheet(item: $membershipBook) { BookCollectionsView(book: $0, library: library) }
+        .sheet(isPresented: $showDeleted) { RecentlyDeletedView(library: library) }
+        .sheet(isPresented: $showAnnotationExport) { AnnotationExportView(library: library) }
+        .onChange(of: library.collections) { _, collections in
+            if let selectedCollectionID, !collections.contains(where: { $0.id == selectedCollectionID }) { self.selectedCollectionID = nil }
+        }
         .alert("无法完成操作", isPresented: Binding(get: { library.errorMessage != nil }, set: { if !$0 { library.errorMessage = nil } })) {
             Button("好", role: .cancel) { library.errorMessage = nil }
         } message: { Text(library.errorMessage ?? "未知错误") }
         .confirmationDialog("要移除这本书吗？", isPresented: Binding(get: { pendingDeletion != nil }, set: { if !$0 { pendingDeletion = nil } }), titleVisibility: .visible) {
-            Button("从书架删除", role: .destructive) { if let book = pendingDeletion { library.delete(book) }; pendingDeletion = nil }
+            Button("移到最近删除", role: .destructive) { if let book = pendingDeletion { library.delete(book) }; pendingDeletion = nil }
             Button("取消", role: .cancel) { pendingDeletion = nil }
-        } message: { Text("文件会从本机删除，无法撤销。") }
+        } message: { Text("可以在书架菜单的“最近删除”中恢复，阅读进度和笔记都会保留。") }
         .overlay { if library.isImporting { importingOverlay } }
     }
 
@@ -70,9 +110,10 @@ struct ContentView: View {
                 if library.books.isEmpty { emptyLibrary }
                 else { bookList }
             }
-            .navigationTitle("书架")
+            .navigationTitle(shelfTitle)
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) { shelfOptions }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button { isImporterPresented = true } label: { Label("导入书籍", systemImage: "plus") }
                         .disabled(library.isImporting)
@@ -87,7 +128,7 @@ struct ContentView: View {
     private var bookList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                if searchText.isEmpty, let book = continueReadingBook {
+                if searchText.isEmpty, filter == .all, selectedCollectionID == nil, let book = continueReadingBook {
                     Text("继续阅读")
                         .font(.title3.weight(.semibold))
                         .padding(.bottom, 12)
@@ -99,8 +140,20 @@ struct ContentView: View {
                 }
 
                 HStack {
-                    Text(searchText.isEmpty ? "全部书籍" : "搜索结果")
-                        .font(.title3.weight(.semibold))
+                    Menu {
+                        Picker("阅读状态", selection: $filter) {
+                            ForEach(ShelfFilter.allCases) { item in
+                                Label(item.name, systemImage: item.symbol).tag(item)
+                            }
+                        }
+                        Divider()
+                        collectionPicker
+                        Button("管理书单", systemImage: "folder.badge.gearshape") { showCollections = true }
+                    } label: {
+                        Label(searchText.isEmpty ? filter.name : "搜索结果", systemImage: "line.3.horizontal.decrease")
+                            .font(.headline)
+                    }
+                    .accessibilityLabel("筛选书架：\(filter.name)")
                     Spacer()
                     Text("\(filteredBooks.count) 本")
                         .font(.subheadline)
@@ -108,29 +161,105 @@ struct ContentView: View {
                 }
                 .padding(.bottom, 10)
 
-                ForEach(filteredBooks) { book in
-                    Button { open(book) } label: {
-                        ShelfBookRow(book: book, coverURL: library.coverURL(for: book))
-                    }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button(role: .destructive) { pendingDeletion = book } label: { Label("删除", systemImage: "trash") }
+                if filteredBooks.isEmpty {
+                    noMatchingBooks
+                        .padding(.vertical, 40)
+                } else if layout == .grid {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 132, maximum: 190), spacing: 20)], alignment: .leading, spacing: 24) {
+                        ForEach(filteredBooks) { book in
+                            Button { open(book) } label: {
+                                ShelfBookGridItem(book: book, coverURL: library.coverURL(for: book))
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu { bookActions(book) }
+                            .overlay(alignment: .topLeading) {
+                                Menu { bookActions(book) } label: {
+                                    Image(systemName: "ellipsis")
+                                        .font(.subheadline.weight(.semibold))
+                                        .frame(width: 30, height: 30)
+                                        .background(.regularMaterial, in: Circle())
+                                }
+                                .accessibilityLabel("管理《\(book.title)》")
+                                .padding(6)
+                            }
                         }
-                    if book.id != filteredBooks.last?.id {
-                        Divider().padding(.leading, 70)
+                    }
+                    .padding(.top, 8)
+                } else {
+                    ForEach(filteredBooks) { book in
+                        HStack(spacing: 8) {
+                            Button { open(book) } label: {
+                                ShelfBookRow(book: book, coverURL: library.coverURL(for: book))
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu { bookActions(book) }
+                            Menu { bookActions(book) } label: {
+                                Image(systemName: "ellipsis")
+                                    .frame(width: 32, height: 44)
+                            }
+                            .accessibilityLabel("管理《\(book.title)》")
+                        }
+                        if book.id != filteredBooks.last?.id {
+                            Divider().padding(.leading, 70)
+                        }
                     }
                 }
             }
-            .frame(maxWidth: 700)
+            .frame(maxWidth: layout == .grid ? 900 : 700)
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 20)
             .padding(.top, 18)
             .padding(.bottom, 28)
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .overlay {
-            if filteredBooks.isEmpty { ContentUnavailableView.search(text: searchText) }
+    }
+
+    private var shelfOptions: some View {
+        Menu {
+            Picker("显示方式", selection: $layoutRaw) {
+                ForEach(ShelfLayout.allCases) { item in Label(item.name, systemImage: item.symbol).tag(item.rawValue) }
+            }
+            Picker("排序", selection: $sortRaw) {
+                ForEach(ShelfSort.allCases) { item in Text(item.name).tag(item.rawValue) }
+            }
+            Divider()
+            collectionPicker
+            Button("管理书单", systemImage: "folder") { showCollections = true }
+            Button("导出划线与笔记", systemImage: "square.and.arrow.up") { showAnnotationExport = true }
+            Button("最近删除（\(library.deletedBooks.count)）", systemImage: "trash") { showDeleted = true }
+        } label: { Label("书架管理", systemImage: layout.symbol) }
+    }
+
+    private var collectionPicker: some View {
+        Picker("书单", selection: $selectedCollectionID) {
+            Text("全部书籍").tag(nil as UUID?)
+            ForEach(library.collections) { collection in Text(collection.name).tag(Optional(collection.id)) }
         }
+    }
+
+    @ViewBuilder
+    private var noMatchingBooks: some View {
+        ContentUnavailableView {
+            Label(searchText.isEmpty ? "这里还没有书籍" : "没有找到书籍", systemImage: filter.symbol)
+        } description: {
+            Text(searchText.isEmpty ? "点书籍旁的“…”可以收藏、标记读完或查看详情。" : "试试其他书名、作者或阅读状态。")
+        } actions: {
+            Button("显示全部书籍") { searchText = ""; filter = .all; selectedCollectionID = nil }
+        }
+    }
+
+    @ViewBuilder
+    private func bookActions(_ book: Book) -> some View {
+        Button { detailsBook = book } label: { Label("书籍详情", systemImage: "info.circle") }
+        Button { membershipBook = book } label: { Label("加入书单", systemImage: "folder.badge.plus") }
+        Button { library.toggleFavorite(book) } label: {
+            Label(book.isFavorite ? "取消收藏" : "收藏", systemImage: book.isFavorite ? "star.slash" : "star")
+        }
+        Button { library.toggleFinished(book) } label: {
+            Label(book.isFinished ? "取消已读完标记" : "标记为已读完", systemImage: "checkmark.circle")
+        }
+        Divider()
+        Button(role: .destructive) { pendingDeletion = book } label: { Label("删除", systemImage: "trash") }
     }
 
     private func open(_ book: Book) {
@@ -152,8 +281,15 @@ struct ContentView: View {
     private var importingOverlay: some View {
         ZStack {
             Color.black.opacity(0.16).ignoresSafeArea()
-            VStack(spacing: 14) { ProgressView(); Text("正在导入并解析…").font(.callout) }
-                .padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+            VStack(spacing: 14) {
+                if let progress = library.importProgress {
+                    ProgressView(value: Double(progress.completed), total: Double(max(1, progress.total)))
+                    Text("正在导入 \(progress.completed + 1)/\(progress.total)").font(.headline)
+                    Text(progress.fileName).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                } else { ProgressView("正在准备导入…") }
+            }
+            .frame(width: 240)
+            .padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
         }
     }
 }
@@ -171,11 +307,11 @@ private struct ContinueReadingCard: View {
                 Text(book.title).font(.headline).lineLimit(2)
                 Text(book.author).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 Spacer(minLength: 8)
-                if book.locator.page > 0 && book.locator.totalPages > 1 {
+                if book.hasStartedReading {
                     ProgressView(value: book.locator.fraction)
                         .tint(.accentColor)
                 }
-                Text(book.locator.page > 0 && book.locator.totalPages > 1 ? "继续阅读 · 已读 \(Int((book.locator.fraction * 100).rounded()))%" : "继续阅读")
+                Text(book.hasStartedReading ? "继续阅读 · \(book.progressLabel)" : "开始阅读")
                     .font(.caption)
                     .foregroundStyle(.tint)
             }
@@ -189,6 +325,37 @@ private struct ContinueReadingCard: View {
     }
 }
 
+private struct ShelfBookGridItem: View {
+    let book: Book
+    let coverURL: URL?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            BookCover(title: book.title, url: coverURL)
+                .aspectRatio(0.7, contentMode: .fit)
+                .clipShape(.rect(cornerRadius: 8))
+                .overlay(alignment: .topTrailing) {
+                    if book.isFavorite {
+                        Image(systemName: "star.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .padding(7)
+                            .background(.regularMaterial, in: Circle())
+                            .padding(6)
+                    }
+                }
+            Text(book.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                .frame(minHeight: 40, alignment: .topLeading)
+            Text(book.author).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Text(book.progressLabel).font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("打开书籍，长按可管理")
+    }
+}
+
 private struct ShelfBookRow: View {
     let book: Book
     let coverURL: URL?
@@ -199,18 +366,16 @@ private struct ShelfBookRow: View {
                 .frame(width: 56, height: 78)
                 .clipShape(.rect(cornerRadius: 5))
             VStack(alignment: .leading, spacing: 6) {
-                Text(book.title).font(.body.weight(.medium)).lineLimit(2)
-                Text(book.author).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-                if book.locator.page > 0 && book.locator.totalPages > 1 {
-                    Text("已读 \(Int((book.locator.fraction * 100).rounded()))%")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(book.title).font(.body.weight(.medium)).lineLimit(2)
+                    if book.isFavorite { Image(systemName: "star.fill").font(.caption).foregroundStyle(.orange) }
                 }
+                Text(book.author).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                Label(book.progressLabel, systemImage: book.isFinished ? "checkmark.circle.fill" : "book")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Image(systemName: "chevron.right")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 11)
         .contentShape(Rectangle())
@@ -219,7 +384,7 @@ private struct ShelfBookRow: View {
     }
 }
 
-private struct BookCover: View {
+struct BookCover: View {
     let title: String
     let url: URL?
     var showsTitle = true
@@ -248,7 +413,17 @@ private struct BookCover: View {
         }
         .task(id: url) {
             image = nil
-            guard let url, let data = try? Data(contentsOf: url), let uiImage = UIImage(data: data) else { return }
+            guard let url else { return }
+            let uiImage = await Task.detached(priority: .utility) {
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 600,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                      ] as CFDictionary) else { return UIImage?.none }
+                return UIImage(cgImage: thumbnail)
+            }.value
+            guard !Task.isCancelled, let uiImage else { return }
             image = Image(uiImage: uiImage)
         }
     }

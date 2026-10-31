@@ -20,6 +20,7 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     @Published var isSpeaking = false
     @Published var controlsVisible = true
     @Published var errorMessage: String?
+    @Published private(set) var sleepTimerEnd: Date?
 
     let book: Book
     private let store: LibraryStore
@@ -34,6 +35,9 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     private var locationWhenSpeechPaused: Locator?
     private var lastSpeechNavigationAt = Date.distantPast
     private var isSpeechNavigating = false
+    private var sleepTimerTask: Task<Void, Never>?
+    private var speechStartTask: Task<Void, Never>?
+    private var appliedPreferences: EPUBPreferences?
 
     init(book: Book, store: LibraryStore, initialSearchLocator: Locator? = nil) {
         self.book = book
@@ -48,7 +52,8 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
         self.speechSettings = speechSettings
         do {
             let publication = try await store.publication(for: book)
-            let savedLocation = try book.locator.locatorJSON.flatMap { try Locator(jsonString: $0) }
+            let currentBook = store.books.first(where: { $0.id == book.id }) ?? book
+            let savedLocation = try currentBook.locator.locatorJSON.flatMap { try Locator(jsonString: $0) }
             let initialLocation = requestedInitialLocation ?? validatedInitialLocation(savedLocation, in: publication)
             let preferences = makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme, font: font)
             let navigator = try EPUBNavigatorViewController(
@@ -81,6 +86,8 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
 
             self.publication = publication
             self.navigator = navigator
+            appliedPreferences = preferences
+            store.recordOpened(bookID: book.id)
             activeSearchResult = requestedInitialLocation
             navigationAdapter = adapter
             verticalScrollNavigationAdapter = verticalScrollAdapter
@@ -108,7 +115,10 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     }
 
     func applyPreferences(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme, font: ReadingFont) {
-        navigator?.submitPreferences(makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme, font: font))
+        let preferences = makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme, font: font)
+        guard let navigator, preferences != appliedPreferences else { return }
+        navigator.submitPreferences(preferences)
+        appliedPreferences = preferences
     }
 
     func goForward() {
@@ -230,11 +240,16 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     }
 
     func toggleSpeech() {
+        checkSleepTimer()
         guard let synthesizer = speechSynthesizer else { return }
         switch synthesizer.state {
         case .stopped:
-            Task {
-                let start = await navigator?.firstVisibleElementLocator() ?? navigator?.currentLocation
+            guard speechStartTask == nil else { return }
+            speechStartTask = Task { [weak self] in
+                guard let self else { return }
+                defer { self.speechStartTask = nil }
+                let start = await self.navigator?.firstVisibleElementLocator() ?? self.navigator?.currentLocation
+                guard !Task.isCancelled else { return }
                 synthesizer.start(from: start)
             }
         case .paused, .playing:
@@ -243,9 +258,41 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     }
 
     func stopSpeech() {
+        speechStartTask?.cancel()
         speechSynthesizer?.stop()
         locationWhenSpeechPaused = nil
         updateSpeechHighlight(nil)
+    }
+
+    func setSleepTimer(minutes: Int) {
+        cancelSleepTimer()
+        guard minutes > 0 else { return }
+        sleepTimerEnd = Date().addingTimeInterval(Double(minutes) * 60)
+        sleepTimerTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(Double(minutes) * 60)) }
+            catch { return }
+            self?.checkSleepTimer()
+        }
+    }
+
+    func cancelSleepTimer() {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerEnd = nil
+    }
+
+    func checkSleepTimer(now: Date = Date()) {
+        guard let end = sleepTimerEnd, end <= now else { return }
+        cancelSleepTimer()
+        stopSpeech()
+    }
+
+    func saveProgress() { store.flushPendingChanges() }
+
+    func close() {
+        cancelSleepTimer()
+        stopSpeech()
+        saveProgress()
     }
 
     private func makePreferences(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme, font: ReadingFont) -> EPUBPreferences {
@@ -358,7 +405,8 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
                 bookID: book.id,
                 locatorJSON: try? locator.jsonString(),
                 position: position,
-                total: totalPositions
+                total: totalPositions,
+                progression: resolvedProgress
             )
         }
     }
@@ -587,6 +635,10 @@ extension ReadiumReaderModel: PublicationSpeechSynthesizerDelegate {
             locationWhenSpeechPaused = navigator?.currentLocation ?? utterance.locator
             updateSpeechHighlight(utterance.locator)
         case let .playing(utterance, range):
+            if let end = sleepTimerEnd, end <= Date() {
+                checkSleepTimer()
+                return
+            }
             isSpeaking = true
             locationWhenSpeechPaused = nil
             updateSpeechHighlight(utterance.locator)

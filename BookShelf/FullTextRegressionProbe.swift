@@ -20,7 +20,7 @@ struct FullTextRegressionProbe: View {
 
     private func run() async {
         var report: [String] = []
-        let library = LibraryStore()
+        let library = LibraryStore(directory: URL.cachesDirectory.appendingPathComponent("BookshelfFullTextRegression", isDirectory: true))
         let source = URL.documentsDirectory.appendingPathComponent("fulltext-probe-\(UUID().uuidString).txt")
         do {
             try "第一章 开始\n蓝鲸在海面上游过。\n第二章 继续\n这里又出现一只蓝鲸。".write(
@@ -30,7 +30,7 @@ struct FullTextRegressionProbe: View {
             guard let book = await library.importBook(from: source) else {
                 throw NSError(domain: library.errorMessage ?? "TXT import failed", code: 1)
             }
-            defer { library.delete(book) }
+            defer { library.delete(book); library.permanentlyDelete(book) }
             let publication = try await library.publication(for: book)
             var hits: [BookSearchMatch] = []
             let truncated = try await FullTextSearch.search(publication: publication, query: "蓝鲸", limit: 10) {
@@ -61,7 +61,7 @@ struct FullTextRegressionProbe: View {
                 guard let epubBook = await library.importBook(from: epubFixture) else {
                     throw NSError(domain: library.errorMessage ?? "EPUB import failed", code: 4)
                 }
-                defer { library.delete(epubBook) }
+                defer { library.delete(epubBook); library.permanentlyDelete(epubBook) }
                 let epub = try await library.publication(for: epubBook)
                 var epubHits: [BookSearchMatch] = []
                 _ = try await FullTextSearch.search(publication: epub, query: "春江潮水", limit: 10) {

@@ -9,7 +9,9 @@ struct ReaderView: View {
     }
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: ReadiumReaderModel
+    private let library: LibraryStore
     @AppStorage("reader.fontSize") private var fontSize = 20.0
     @AppStorage("reader.lineSpacing") private var lineSpacing = 8.0
     @AppStorage("reader.theme") private var theme = ReadingTheme.paper.rawValue
@@ -30,8 +32,10 @@ struct ReaderView: View {
     @State private var isScrubbingProgress = false
     @State private var panel: Panel = .chapters
     @State private var editingMark: ReaderMark?
+    @State private var showAnnotationExport = false
 
     init(book: Book, library: LibraryStore, initialSearchLocator: Locator? = nil) {
+        self.library = library
         _model = StateObject(wrappedValue: ReadiumReaderModel(book: book, store: library, initialSearchLocator: initialSearchLocator))
     }
 
@@ -147,7 +151,11 @@ struct ReaderView: View {
                 sliderProgress = value
             }
         }
-        .onDisappear { model.stopSpeech() }
+        .onDisappear { model.close() }
+        .onChange(of: scenePhase) { _, phase in
+            model.saveProgress()
+            if phase == .active { model.checkSleepTimer() }
+        }
         .onChange(of: font) { _, _ in applyReadingPreferences() }
         .sheet(isPresented: $showChapters) { chapterSheet }
         .sheet(item: $editingMark) { mark in
@@ -342,7 +350,15 @@ struct ReaderView: View {
                 }
             }
             .navigationTitle("目录与标注").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showChapters = false } } }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if panel == .highlights && !model.readerMarks.isEmpty {
+                        Button("导出", systemImage: "square.and.arrow.up") { showAnnotationExport = true }
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) { Button("完成") { showChapters = false } }
+            }
+            .sheet(isPresented: $showAnnotationExport) { AnnotationExportView(library: library, bookID: model.book.id) }
         }.presentationDetents([.medium, .large])
     }
 
@@ -373,6 +389,26 @@ struct ReaderView: View {
                     Slider(value: $fontSize, in: 15...30, step: 1)
                     LabeledContent("行距", value: "\(Int(lineSpacing))")
                     Slider(value: $lineSpacing, in: 2...16, step: 1)
+                }
+                Section {
+                    Menu {
+                        ForEach([15, 30, 45, 60], id: \.self) { minutes in
+                            Button("\(minutes) 分钟后") { model.setSleepTimer(minutes: minutes) }
+                        }
+                    } label: {
+                        Label("定时停止朗读", systemImage: "moon.zzz")
+                    }
+                    if let end = model.sleepTimerEnd {
+                        LabeledContent("剩余时间") {
+                            Text(timerInterval: Date()...max(Date(), end), countsDown: true)
+                                .monospacedDigit()
+                        }
+                        Button("取消定时", role: .destructive) { model.cancelSleepTimer() }
+                    }
+                } header: {
+                    Text("睡眠定时")
+                } footer: {
+                    Text("到时自动停止朗读。暂停期间也会计时，离开阅读页后取消。")
                 }
             }
             .navigationTitle("阅读设置").navigationBarTitleDisplayMode(.inline)

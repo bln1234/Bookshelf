@@ -8,14 +8,64 @@ struct Book: Identifiable, Codable, Hashable {
     var coverFileName: String?
     let importedAt: Date
     var locator: ReaderLocator
+    var isFavorite = false
+    var isFinished = false
+    var lastOpenedAt: Date?
+    var sourceFormat: String?
+    var collectionIDs: [UUID] = []
+    var deletedAt: Date?
+
+    var hasStartedReading: Bool { lastOpenedAt != nil || locator.locatorJSON != nil || locator.page > 0 }
+    var progressLabel: String {
+        if isFinished { return "已读完" }
+        return hasStartedReading ? "已读 \(Int((locator.fraction * 100).rounded()))%" : "未开始"
+    }
+}
+
+extension Book {
+    private enum CodingKeys: String, CodingKey {
+        case id, title, author, fileName, coverFileName, importedAt, locator
+        case isFavorite, isFinished, lastOpenedAt, sourceFormat, collectionIDs, deletedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        author = try values.decode(String.self, forKey: .author)
+        fileName = try values.decode(String.self, forKey: .fileName)
+        coverFileName = try values.decodeIfPresent(String.self, forKey: .coverFileName)
+        importedAt = try values.decode(Date.self, forKey: .importedAt)
+        locator = try values.decode(ReaderLocator.self, forKey: .locator)
+        isFavorite = try values.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+        isFinished = try values.decodeIfPresent(Bool.self, forKey: .isFinished) ?? false
+        lastOpenedAt = try values.decodeIfPresent(Date.self, forKey: .lastOpenedAt)
+        sourceFormat = try values.decodeIfPresent(String.self, forKey: .sourceFormat)
+        collectionIDs = try values.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
+        deletedAt = try values.decodeIfPresent(Date.self, forKey: .deletedAt)
+    }
+}
+
+struct BookCollection: Identifiable, Codable, Hashable {
+    let id: UUID
+    var name: String
+    let createdAt: Date
+}
+
+struct LibrarySnapshot: Codable {
+    var version = 1
+    var books: [Book]
+    var collections: [BookCollection]
 }
 
 struct ReaderLocator: Codable, Hashable {
     var page: Int = 0
     var totalPages: Int = 0
     var locatorJSON: String?
+    var progression: Double?
 
     var fraction: Double {
+        if let progression, progression.isFinite { return min(1, max(0, progression)) }
         guard totalPages > 1 else { return 0 }
         return min(1, max(0, Double(page) / Double(totalPages - 1)))
     }

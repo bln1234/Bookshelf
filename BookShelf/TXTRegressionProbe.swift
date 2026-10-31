@@ -39,7 +39,7 @@ struct TXTRegressionProbe: View {
                 guard let book = await library.importBook(from: source) else {
                     throw NSError(domain: library.errorMessage ?? "Import failed: \(name)", code: 2)
                 }
-                defer { library.delete(book) }
+                defer { library.delete(book); library.permanentlyDelete(book) }
 
                 let publication = try await library.publication(for: book)
                 let toc = try await publication.tableOfContents().get()

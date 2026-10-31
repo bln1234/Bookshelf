@@ -17,7 +17,7 @@ struct FontRegressionProbe: View {
                 guard let book = await library.importBook(from: .documentsDirectory.appendingPathComponent("font-test.epub")) else {
                     throw NSError(domain: library.errorMessage ?? "import", code: 1)
                 }
-                defer { library.delete(book) }
+                defer { library.delete(book); library.permanentlyDelete(book) }
                 let reader = ReadiumReaderModel(book: book, store: library)
                 await reader.load(fontSize: 20, lineSpacing: 8, mode: .page, theme: .paper, font: .publisher, speechSettings: .init())
                 model = reader
