@@ -4,12 +4,14 @@ import Foundation
 @preconcurrency import ReadiumNavigator
 import ReadiumShared
 import UIKit
+import WebKit
 
 @MainActor
 final class ReadiumReaderModel: NSObject, ObservableObject {
     @Published private(set) var navigator: EPUBNavigatorViewController?
     @Published private(set) var publication: Publication?
     @Published private(set) var tableOfContents: [Link] = []
+    @Published private(set) var readerMarks: [ReaderMark] = []
     @Published private(set) var position = 1
     @Published private(set) var totalPositions = 0
     @Published var progression = 0.0
@@ -18,39 +20,65 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     @Published var isSpeaking = false
     @Published var controlsVisible = true
     @Published var errorMessage: String?
+    @Published private(set) var sleepTimerEnd: Date?
 
     let book: Book
     private let store: LibraryStore
+    private let requestedInitialLocation: Locator?
     private var speechSynthesizer: PublicationSpeechSynthesizer?
     private var navigationAdapter: DirectionalNavigationAdapter?
+    private var verticalScrollNavigationAdapter: VerticalScrollNavigationAdapter?
     private var speechSettings = SpeechSettings()
+    private var positionCountsByReadingOrder: [Int] = []
     private var highlightedUtterance: Locator?
+    private var activeSearchResult: Locator?
+    private var locationWhenSpeechPaused: Locator?
     private var lastSpeechNavigationAt = Date.distantPast
     private var isSpeechNavigating = false
+    private var sleepTimerTask: Task<Void, Never>?
+    private var speechStartTask: Task<Void, Never>?
+    private var appliedPreferences: EPUBPreferences?
 
-    init(book: Book, store: LibraryStore) {
+    init(book: Book, store: LibraryStore, initialSearchLocator: Locator? = nil) {
         self.book = book
         self.store = store
+        requestedInitialLocation = initialSearchLocator
+        readerMarks = store.readerMarks(for: book.id)
     }
 
-    func load(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme, speechSettings: SpeechSettings) async {
+    func load(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme, font: ReadingFont, speechSettings: SpeechSettings) async {
         guard navigator == nil else { return }
         isLoading = true
         self.speechSettings = speechSettings
         do {
             let publication = try await store.publication(for: book)
-            let savedLocation = try book.locator.locatorJSON.flatMap { try Locator(jsonString: $0) }
-            let initialLocation = validatedInitialLocation(savedLocation, in: publication)
-            let preferences = makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme)
+            let currentBook = store.books.first(where: { $0.id == book.id }) ?? book
+            let savedLocation = try currentBook.locator.locatorJSON.flatMap { try Locator(jsonString: $0) }
+            let initialLocation = requestedInitialLocation ?? validatedInitialLocation(savedLocation, in: publication)
+            let preferences = makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme, font: font)
             let navigator = try EPUBNavigatorViewController(
                 publication: publication,
                 initialLocation: initialLocation,
-                config: .init(preferences: preferences)
+                config: .init(
+                    preferences: preferences,
+                    editingActions: EditingAction.defaultActions + [
+                        EditingAction(title: "划线", action: #selector(ReaderNavigatorHostController.highlightSelection)),
+                        EditingAction(title: "笔记", action: #selector(ReaderNavigatorHostController.noteSelection))
+                    ],
+                    disablePageTurnsWhileScrolling: true,
+                    contentInset: [
+                        .compact: (top: 48, bottom: 34),
+                        .regular: (top: 72, bottom: 62),
+                    ],
+                    fontFamilyDeclarations: ReaderFonts.declarations()
+                )
             )
             navigator.delegate = self
 
             let adapter = DirectionalNavigationAdapter(animatedTransition: true)
             adapter.bind(to: navigator)
+            let verticalScrollAdapter = VerticalScrollNavigationAdapter(navigator: navigator)
+            verticalScrollAdapter.bind()
             navigator.addObserver(.activate { [weak self] _ in
                 self?.controlsVisible.toggle()
                 return true
@@ -58,8 +86,17 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
 
             self.publication = publication
             self.navigator = navigator
+            appliedPreferences = preferences
+            store.recordOpened(bookID: book.id)
+            activeSearchResult = requestedInitialLocation
             navigationAdapter = adapter
+            verticalScrollNavigationAdapter = verticalScrollAdapter
             tableOfContents = flatten((try? await publication.tableOfContents().get()) ?? [])
+            positionCountsByReadingOrder = ((try? await publication.positionsByReadingOrder().get()) ?? []).map(\.count)
+            totalPositions = positionCountsByReadingOrder.reduce(0, +)
+            if let location = navigator.currentLocation ?? initialLocation {
+                updateReadingProgress(from: location)
+            }
             speechSynthesizer = PublicationSpeechSynthesizer(
                 publication: publication,
                 config: .init(
@@ -69,34 +106,129 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
                 engineFactory: { [weak self] in AVTTSEngine(delegate: self) },
                 delegate: self
             )
+            applySearchHighlight()
+            applySavedHighlights()
         } catch {
             errorMessage = error.localizedDescription
         }
         isLoading = false
     }
 
-    func applyPreferences(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme) {
-        navigator?.submitPreferences(makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme))
+    func applyPreferences(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme, font: ReadingFont) {
+        let preferences = makePreferences(fontSize: fontSize, lineSpacing: lineSpacing, mode: mode, theme: theme, font: font)
+        guard let navigator, preferences != appliedPreferences else { return }
+        navigator.submitPreferences(preferences)
+        appliedPreferences = preferences
     }
 
     func goForward() {
         Task {
             guard let navigator, isNavigatorReady else { return }
-            if await navigator.goForward(options: .animated) == false {
-                await moveToAdjacentResource(offset: 1, navigator: navigator)
-            }
+            _ = await navigator.goForward(options: .animated)
         }
     }
 
     func goBackward() {
         Task {
             guard let navigator, isNavigatorReady else { return }
-            if await navigator.goBackward(options: .animated) == false {
-                await moveToAdjacentResource(offset: -1, navigator: navigator)
-            }
+            _ = await navigator.goBackward(options: .animated)
         }
     }
     func go(to link: Link) { Task { await navigator?.go(to: link, options: .animated) } }
+
+    func go(toSearchResult locator: Locator) {
+        stopSpeech()
+        activeSearchResult = locator
+        Task {
+            guard let navigator else { return }
+            guard await navigator.go(to: locator, options: .animated) else {
+                errorMessage = "无法跳转到这条搜索结果，请重试。"
+                return
+            }
+            applySearchHighlight()
+            controlsVisible = false
+        }
+    }
+
+    private func applySearchHighlight() {
+        guard let navigator else { return }
+        let decorations = activeSearchResult.map {
+            [Decoration(id: "search-current-hit", locator: $0, style: .highlight(tint: UIColor.systemOrange.withAlphaComponent(0.4)))]
+        } ?? []
+        navigator.apply(decorations: decorations, in: "search")
+    }
+
+    private func applySavedHighlights() {
+        guard let navigator else { return }
+        let decorations = readerMarks.compactMap { mark -> Decoration? in
+            guard mark.kind == .highlight, let locator = mark.locator else { return nil }
+            return Decoration(
+                id: mark.id.uuidString,
+                locator: locator,
+                style: .highlight(tint: mark.color.tint.withAlphaComponent(0.45))
+            )
+        }
+        navigator.apply(decorations: decorations, in: "reader-marks")
+    }
+
+    func makeHighlight(at locator: Locator) -> ReaderMark? {
+        guard let text = locator.text.highlight?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            errorMessage = "没有选中的文字，请重新选择。"
+            return nil
+        }
+        guard let locatorJSON = try? locator.jsonString() else {
+            errorMessage = "无法保存当前位置，请重试。"
+            return nil
+        }
+        let chapter = locator.title
+            ?? tableOfContents.first(where: { $0.url().isEquivalentTo(locator.href) })?.title
+            ?? "当前位置"
+        return ReaderMark(
+            id: UUID(), kind: .highlight, locatorJSON: locatorJSON, chapter: chapter,
+            excerpt: text, note: "", color: .yellow, createdAt: Date()
+        )
+    }
+
+    @discardableResult
+    func saveReaderMark(_ mark: ReaderMark) -> Bool {
+        guard mark.kind == .highlight else { return false }
+        do {
+            try store.saveReaderMark(mark, for: book.id)
+            readerMarks = store.readerMarks(for: book.id)
+            if mark.kind == .highlight { applySavedHighlights() }
+            return true
+        } catch {
+            errorMessage = "无法保存划线与笔记：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    func removeReaderMark(_ mark: ReaderMark) -> Bool {
+        do {
+            try store.removeReaderMark(id: mark.id, for: book.id)
+            readerMarks = store.readerMarks(for: book.id)
+            if mark.kind == .highlight { applySavedHighlights() }
+            return true
+        } catch {
+            errorMessage = "无法删除划线与笔记：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func go(to mark: ReaderMark) {
+        guard let locator = mark.locator else {
+            errorMessage = "这条划线或笔记的位置已失效。"
+            return
+        }
+        Task {
+            guard await navigator?.go(to: locator, options: .animated) == true else {
+                errorMessage = "无法跳转到划线或笔记，请重试。"
+                return
+            }
+            controlsVisible = false
+        }
+    }
 
     func go(to progression: Double) {
         guard let publication, let navigator else { return }
@@ -108,11 +240,16 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     }
 
     func toggleSpeech() {
+        checkSleepTimer()
         guard let synthesizer = speechSynthesizer else { return }
         switch synthesizer.state {
         case .stopped:
-            Task {
-                let start = await navigator?.firstVisibleElementLocator() ?? navigator?.currentLocation
+            guard speechStartTask == nil else { return }
+            speechStartTask = Task { [weak self] in
+                guard let self else { return }
+                defer { self.speechStartTask = nil }
+                let start = await self.navigator?.firstVisibleElementLocator() ?? self.navigator?.currentLocation
+                guard !Task.isCancelled else { return }
                 synthesizer.start(from: start)
             }
         case .paused, .playing:
@@ -121,13 +258,46 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
     }
 
     func stopSpeech() {
+        speechStartTask?.cancel()
         speechSynthesizer?.stop()
+        locationWhenSpeechPaused = nil
         updateSpeechHighlight(nil)
     }
 
-    private func makePreferences(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme) -> EPUBPreferences {
+    func setSleepTimer(minutes: Int) {
+        cancelSleepTimer()
+        guard minutes > 0 else { return }
+        sleepTimerEnd = Date().addingTimeInterval(Double(minutes) * 60)
+        sleepTimerTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(Double(minutes) * 60)) }
+            catch { return }
+            self?.checkSleepTimer()
+        }
+    }
+
+    func cancelSleepTimer() {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerEnd = nil
+    }
+
+    func checkSleepTimer(now: Date = Date()) {
+        guard let end = sleepTimerEnd, end <= now else { return }
+        cancelSleepTimer()
+        stopSpeech()
+    }
+
+    func saveProgress() { store.flushPendingChanges() }
+
+    func close() {
+        cancelSleepTimer()
+        stopSpeech()
+        saveProgress()
+    }
+
+    private func makePreferences(fontSize: Double, lineSpacing: Double, mode: ReadingMode, theme: ReadingTheme, font: ReadingFont) -> EPUBPreferences {
         EPUBPreferences(
-            fontFamily: .serif,
+            fontFamily: ReaderFonts.family(for: font),
             fontSize: max(0.7, min(2.0, fontSize / 20.0)),
             lineHeight: max(1.1, min(2.2, 1.25 + lineSpacing / 20.0)),
             publisherStyles: true,
@@ -161,18 +331,6 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
         return nil
     }
 
-    private func moveToAdjacentResource(offset: Int, navigator: EPUBNavigatorViewController) async {
-        guard
-            let publication,
-            let href = navigator.currentLocation?.href,
-            let currentIndex = publication.readingOrder.firstIndex(where: { $0.url().isEquivalentTo(href) })
-        else { return }
-
-        let targetIndex = currentIndex + offset
-        guard publication.readingOrder.indices.contains(targetIndex) else { return }
-        _ = await navigator.go(to: publication.readingOrder[targetIndex], options: .animated)
-    }
-
     private func updateSpeechHighlight(_ locator: Locator?) {
         guard highlightedUtterance != locator else { return }
         highlightedUtterance = locator
@@ -204,17 +362,260 @@ final class ReadiumReaderModel: NSObject, ObservableObject {
             self.isSpeechNavigating = false
         }
     }
+
+    private func updateReadingProgress(from locator: Locator, persist: Bool = true) {
+        let fallbackProgress = min(1, max(0, locator.locations.totalProgression ?? progression))
+        var resolvedProgress = fallbackProgress
+        var resolvedPosition = locator.locations.position
+
+        if
+            totalPositions > 0,
+            let publication,
+            let resourceIndex = publication.readingOrder.firstIndex(where: { $0.url().isEquivalentTo(locator.href) }),
+            positionCountsByReadingOrder.indices.contains(resourceIndex)
+        {
+            let positionsBeforeResource = positionCountsByReadingOrder[..<resourceIndex].reduce(0, +)
+            let positionsInResource = positionCountsByReadingOrder[resourceIndex]
+
+            if positionsInResource > 0 {
+                let inferredResourceProgress = resolvedPosition.map {
+                    Double(max(0, $0 - positionsBeforeResource - 1)) / Double(positionsInResource)
+                }
+                let resourceProgress = min(1, max(0, locator.locations.progression ?? inferredResourceProgress ?? 0))
+                resolvedProgress = min(
+                    1,
+                    max(0, (Double(positionsBeforeResource) + resourceProgress * Double(positionsInResource)) / Double(totalPositions))
+                )
+                let localPosition = min(positionsInResource - 1, Int(floor(resourceProgress * Double(positionsInResource))))
+                resolvedPosition = positionsBeforeResource + localPosition + 1
+            }
+        }
+
+        if totalPositions > 0 {
+            resolvedPosition = min(totalPositions, max(1, resolvedPosition ?? Int((resolvedProgress * Double(totalPositions - 1)).rounded()) + 1))
+        } else {
+            resolvedPosition = max(1, resolvedPosition ?? 1)
+        }
+
+        progression = resolvedProgress
+        position = resolvedPosition ?? 1
+
+        if persist {
+            store.updateLocation(
+                bookID: book.id,
+                locatorJSON: try? locator.jsonString(),
+                position: position,
+                total: totalPositions,
+                progression: resolvedProgress
+            )
+        }
+    }
+
+    private func readingLocationChanged(from previous: Locator, to current: Locator) -> Bool {
+        if !previous.href.isEquivalentTo(current.href) {
+            return true
+        }
+        if let previousPosition = previous.locations.position,
+           let currentPosition = current.locations.position,
+           previousPosition != currentPosition {
+            return true
+        }
+
+        let previousProgression = previous.locations.progression ?? previous.locations.totalProgression
+        let currentProgression = current.locations.progression ?? current.locations.totalProgression
+        if let previousProgression, let currentProgression {
+            return abs(previousProgression - currentProgression) > 0.0005
+        }
+        return false
+    }
+}
+
+/// Readium scrolls continuously inside one spine item, but its built-in
+/// cross-chapter gesture is horizontal. This adapter keeps scroll mode
+/// vertical by turning to the adjacent spine item when the user swipes again
+/// at the top or bottom edge of the current item.
+@MainActor
+private final class VerticalScrollNavigationAdapter: NSObject, UIGestureRecognizerDelegate {
+    private enum Direction {
+        case backward, forward
+    }
+
+    private weak var navigator: EPUBNavigatorViewController?
+    private lazy var panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+    private var pendingDirection: Direction?
+    private var isNavigating = false
+
+    init(navigator: EPUBNavigatorViewController) {
+        self.navigator = navigator
+    }
+
+    func bind() {
+        guard let view = navigator?.view else { return }
+        panGesture.delegate = self
+        panGesture.cancelsTouchesInView = false
+        view.addGestureRecognizer(panGesture)
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        pendingDirection = nil
+        guard
+            !isNavigating,
+            let navigator,
+            navigator.presentation.scroll,
+            let scrollView = activeWebScrollView(in: navigator),
+            let pan = gestureRecognizer as? UIPanGestureRecognizer
+        else { return false }
+
+        let velocity = pan.velocity(in: navigator.view)
+        guard abs(velocity.y) > abs(velocity.x) * 1.15 else { return false }
+
+        let inset = scrollView.adjustedContentInset
+        let minimumY = -inset.top
+        let maximumY = max(minimumY, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom)
+        let tolerance = 2.0
+
+        if velocity.y < 0, scrollView.contentOffset.y >= maximumY - tolerance {
+            pendingDirection = .forward
+            return true
+        }
+        if velocity.y > 0, scrollView.contentOffset.y <= minimumY + tolerance {
+            pendingDirection = .backward
+            return true
+        }
+        return false
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
+    }
+
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        guard gesture.state == .ended, let direction = pendingDirection, let navigator else {
+            if gesture.state == .cancelled || gesture.state == .failed {
+                pendingDirection = nil
+            }
+            return
+        }
+        pendingDirection = nil
+
+        let translationY = gesture.translation(in: navigator.view).y
+        let velocityY = gesture.velocity(in: navigator.view).y
+        let shouldNavigate: Bool = {
+            switch direction {
+            case .forward: translationY < -44 || velocityY < -550
+            case .backward: translationY > 44 || velocityY > 550
+            }
+        }()
+        guard shouldNavigate else { return }
+
+        isNavigating = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isNavigating = false }
+            guard let navigator = self.navigator else { return }
+            switch direction {
+            case .forward:
+                _ = await navigator.goForward(options: .animated)
+            case .backward:
+                _ = await navigator.goBackward(options: .animated)
+            }
+        }
+    }
+
+    private func activeWebScrollView(in navigator: EPUBNavigatorViewController) -> UIScrollView? {
+        let viewport = navigator.view.bounds
+        return navigator.view
+            .descendants(of: WKWebView.self)
+            .map { webView in
+                (scrollView: webView.scrollView, visibleArea: webView.convert(webView.bounds, to: navigator.view).intersection(viewport).area)
+            }
+            .filter { $0.visibleArea > 1 }
+            .max { $0.visibleArea < $1.visibleArea }?
+            .scrollView
+    }
+}
+
+private extension UIView {
+    func descendants<T: UIView>(of type: T.Type) -> [T] {
+        subviews.flatMap { view in
+            (view as? T).map { [$0] } ?? view.descendants(of: type)
+        }
+    }
+}
+
+private extension CGRect {
+    var area: CGFloat {
+        isNull || isEmpty ? 0 : width * height
+    }
 }
 
 extension ReadiumReaderModel: EPUBNavigatorDelegate {
-    func navigator(_ navigator: EPUBNavigatorViewController, viewportDidChange viewport: EPUBNavigatorViewController.Viewport?) {
+    func navigator(_ navigator: EPUBNavigatorViewController, setupUserScripts userContentController: WKUserContentController) {
+        // Readium intentionally preserves author fonts on elements carrying a
+        // language attribute. Many CJK EPUBs wrap every sentence in such
+        // spans, which makes the standard font preference appear ineffective.
+        // Keep Readium's CSS variable as the source of truth, but extend the
+        // override to normal text elements regardless of their lang attribute.
+        let source = #"""
+        (() => {
+          if (document.getElementById("bookshelf-font-override")) return;
+          const style = document.createElement("style");
+          style.id = "bookshelf-font-override";
+          style.textContent = `
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] {
+              font-family: var(--USER__fontFamily) !important;
+            }
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] body,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] p,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] li,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] div,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] blockquote,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] h1,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] h2,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] h3,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] h4,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] h5,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] h6,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] span,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] a,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] em,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] strong,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] ruby,
+            :root[style*="readium-font-on"][style*="--USER__fontFamily"] rt {
+              font-family: var(--USER__fontFamily) !important;
+            }
+          `;
+          (document.head || document.documentElement).appendChild(style);
+        })();
+        """#
+        userContentController.addUserScript(WKUserScript(
+            source: source,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: false
+        ))
+    }
+
+    func navigator(_ navigator: any ViewportObservingNavigator, viewportDidChange viewport: NavigatorViewport?) {
         isNavigatorReady = viewport != nil
+        if viewport != nil { applySearchHighlight() }
     }
 
     func navigator(_ navigator: Navigator, locationDidChange locator: Locator) {
-        progression = locator.locations.totalProgression ?? progression
-        position = locator.locations.position ?? max(1, Int(progression * Double(max(1, totalPositions))))
-        store.updateLocation(bookID: book.id, locatorJSON: locator.jsonString, position: position, total: totalPositions)
+        updateReadingProgress(from: locator)
+
+        guard
+            case .paused = speechSynthesizer?.state,
+            let pausedLocation = locationWhenSpeechPaused,
+            readingLocationChanged(from: pausedLocation, to: locator)
+        else { return }
+
+        // A paused utterance belongs to the old viewport. Discard it after the
+        // reader moves so the next play starts at the first visible text on the
+        // newly selected page instead of resuming off-screen audio.
+        stopSpeech()
     }
 
     func navigator(_ navigator: Navigator, presentError error: NavigatorError) {
@@ -227,12 +628,19 @@ extension ReadiumReaderModel: PublicationSpeechSynthesizerDelegate {
         switch state {
         case .stopped:
             isSpeaking = false
+            locationWhenSpeechPaused = nil
             updateSpeechHighlight(nil)
         case let .paused(utterance):
             isSpeaking = false
+            locationWhenSpeechPaused = navigator?.currentLocation ?? utterance.locator
             updateSpeechHighlight(utterance.locator)
         case let .playing(utterance, range):
+            if let end = sleepTimerEnd, end <= Date() {
+                checkSleepTimer()
+                return
+            }
             isSpeaking = true
+            locationWhenSpeechPaused = nil
             updateSpeechHighlight(utterance.locator)
             if let range { followSpokenWord(range) }
         }
